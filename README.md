@@ -6,7 +6,7 @@ A Python-based AI assistant that uses a locally running Large Language Model (LL
 
 The diagram below illustrates the project's architecture and how its components interact.
 
-**[View Project HLD on Excalidraw](https://excalidraw.com/#json=B4LQ-nZ8VlSduX_FqNYDH,v0nM5I8BHAkuwQsOpgBExQ)**
+**[View Project HLD on Excalidraw](https://excalidraw.com/#json=fGIPpdaFOtvitql6z395Z,xwtCvoeFQmAYCfC6RUnb3w)**
 
 ## Tech Stack
 
