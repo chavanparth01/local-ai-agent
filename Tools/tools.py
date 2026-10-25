@@ -4,6 +4,7 @@ import os
 import pathlib
 import json
 import subprocess
+import time
 
 # *Third party imports : 
 from dotenv import load_dotenv
@@ -14,7 +15,7 @@ from Storage.storage import (
     update_user_fact_db,
     delete_user_fact_db,
 )
-from Utils.utilities import log, get_api_json
+from Utils.utilities import log, get_api_json, log_tool_execution
 
 # *Global Variables
 user_city = ""
@@ -171,7 +172,15 @@ def read_file(file_path):
         if not path.is_file():
             return f"Error: File not found at '{file_path}'."
         content = path.read_text(encoding="utf-8", errors="replace")
-        return content[:10000]
+        max_chars = 3500
+        if len(content) > max_chars:
+            omitted = len(content) - 3000
+            return (
+                content[:2500]
+                + f"\n...[Output truncated: {omitted} characters omitted to preserve context budget]...\n"
+                + content[-500:]
+            )
+        return content
     except Exception as e:
         return f"Failed to read file: {str(e)}"
 
@@ -195,6 +204,10 @@ def list_directory(directory_path):
         for item in sorted(path.iterdir()):
             item_type = "DIR" if item.is_dir() else "FILE"
             entries.append(f"[{item_type}] {item.name}")
+        max_entries = 80
+        if len(entries) > max_entries:
+            omitted = len(entries) - max_entries
+            entries = entries[:max_entries] + [f"...[Output truncated: {omitted} additional directory entries omitted to preserve context budget]..."]
         return entries
     except Exception as e:
         return f"Failed to list directory: {str(e)}"
@@ -216,6 +229,22 @@ def execute_command(command):
         output = result.stdout.strip()
         error = result.stderr.strip()
         
+        max_chars = 3500
+        if len(output) > max_chars:
+            omitted = len(output) - 3000
+            output = (
+                output[:2500]
+                + f"\n...[Output truncated: {omitted} characters omitted to preserve context budget]...\n"
+                + output[-500:]
+            )
+        if len(error) > 2000:
+            omitted = len(error) - 1700
+            error = (
+                error[:1500]
+                + f"\n...[Error output truncated: {omitted} characters omitted]...\n"
+                + error[-200:]
+            )
+
         if result.returncode == 0:
             return output if output else "Command executed successfully with no output."
         else:
@@ -229,25 +258,34 @@ def execute_command(command):
 
 # !Function to run tools
 def run_tool(tool_call):
+    start_time = time.time()
+    func_name = getattr(getattr(tool_call, "function", None), "name", "unknown")
     try:
-        func_name = getattr(getattr(tool_call, "function", None), "name", "")
         func_arguments = getattr(getattr(tool_call, "function", None), "arguments", "{}")
 
         if func_name not in function_map:
-            return f"error: Tool '{func_name}' is not recognized."
+            err = f"error: Tool '{func_name}' is not recognized."
+            log_tool_execution(func_name, time.time() - start_time, success=False, error=err)
+            return err
 
         actual_func = function_map[func_name]
         args = json.loads(func_arguments) if func_arguments else {}
 
         if not isinstance(args, dict):
-            return f"error: Arguments for tool '{func_name}' must be a dictionary/object."
+            err = f"error: Arguments for tool '{func_name}' must be a dictionary/object."
+            log_tool_execution(func_name, time.time() - start_time, success=False, error=err)
+            return err
 
         func_response = actual_func(**args)
-        log(f"Tool {func_name} called successfully with arguments : {args} and response : {func_response}")
+        duration = time.time() - start_time
+        log_tool_execution(func_name, duration, success=True)
+        log(f"Tool {func_name} called successfully with arguments : {args}")
 
     except Exception as e:
+        duration = time.time() - start_time
         func_name = getattr(getattr(tool_call, "function", None), "name", "unknown")
         func_response = f"error while running function {func_name} : {str(e)}"
+        log_tool_execution(func_name, duration, success=False, error=str(e))
 
     return func_response
 

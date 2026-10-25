@@ -1,6 +1,6 @@
-# Local AI Assistant with Tool Calling
+# Local AI Assistant with Tool Calling & Cloud Reasoning
 
-A Python-based AI assistant that uses a locally running Large Language Model (LLM) to answer questions, call Python tools, retrieve weather information, and search the web when needed.
+A Python-based AI assistant that uses **Groq Cloud** with **`openai/gpt-oss-120b`** (or a local **Ollama** model) to answer questions, execute multi-step tools, manage local files and terminal commands with interactive security, retrieve weather, and search the web.
 
 ## High-Level Design (HLD)
 
@@ -10,26 +10,25 @@ The diagram below illustrates the project's architecture and how its components 
 
 ## Tech Stack
 
-- **Python** — Application logic and tool execution
-- **Ollama** — Runs the language model locally
-- **Qwen3 4B** — Language model
-- **OpenAI Python SDK** — Communicates with the model through a compatible API
-- **WeatherAPI** — Provides current weather and forecast data
-- **Web Search** — Retrieves online information
-- **Requests** — Makes HTTP requests to external APIs
-- **python-dotenv** — Loads configuration from environment variables
+- **Python 3.10+** — Application logic, sandbox security, and tool execution
+- **Groq Cloud** — Ultra-fast cloud inference for open-weights reasoning models (`openai/gpt-oss-120b`)
+- **Ollama (Optional Fallback)** — Local LLM provider (`qwen3:4b`) for offline environments
+- **OpenAI Python SDK** — Communicates with Groq or Ollama through the standard OpenAI-compatible API
+- **SQLite3** — Persistent local database for conversations, message history, and long-term user facts
+- **WeatherAPI** — Current weather and multi-day forecasts
+- **Tavily Search API** — Live web search and citations
+- **Requests & python-dotenv** — API calls and environment configuration
 
 ## Features
 
-- **Local LLM Execution** — Runs local LLMs via Ollama (or any OpenAI-compatible API).
-- **Autonomous Tool Calling** — Agent evaluates queries and dynamically executes Python tools.
-- **Persistent Memory & Storage** — SQLite-backed conversation history and long-term user facts memory.
-- **Weather & Forecasts** — Retrieves current weather and multi-day forecasts via WeatherAPI.
-- **Live Web Search** — Queries real-time web results using Tavily Search API.
-- **File System Operations** — Read files, write files, and explore directories on the host machine.
-- **Terminal Execution** — Execute shell commands with safety timeouts.
-- **Interactive Security Sandbox** — Confirms user consent before accessing paths outside approved directories or executing shell commands.
-- **Conversation Session Management** — Pick up previous chat threads or start fresh conversations with context budget limits.
+- **Groq Cloud Reasoning** — Powered by `openai/gpt-oss-120b` for precision tool calling, reasoning, and multi-step tasks.
+- **Provider Switching** — Switch seamlessly between Groq Cloud and local Ollama simply by updating environment variables.
+- **Autonomous Tool Calling** — Dynamically executes tools across web search, weather, system files, and terminal.
+- **Persistent Memory & Storage** — SQLite storage (`assistant.db`) for multi-turn chats and long-term fact memory (`save_user_facts_to_db`, `update_user_fact`, `delete_user_fact`).
+- **Interactive Security Sandbox** — Confirms user consent (`y/n`) before accessing files outside the workspace or executing terminal commands.
+- **Token-Aware Context Management** — Conservative token estimation accounting for system prompts, tools schema, completion reservations, and conversation turns. Prevents Groq Free Tier 8,000 TPM limit breaches while maintaining atomic assistant/tool call sequences and preserving SQLite history intact.
+- **Diagnostics & Observability** — Structured latency, finish reason, token budget margin, and tool duration logging when `DEBUG=true`.
+- **Subprocess Safety** — 15-second execution timeout prevents runaway terminal commands.
 
 ## Project Structure
 
@@ -37,114 +36,128 @@ The diagram below illustrates the project's architecture and how its components 
 PY/
 ├── Storage/
 │   ├── __init__.py
-│   └── storage.py
+│   └── storage.py          # SQLite database schema and persistence CRUD
 ├── Tools/
 │   ├── __init__.py
-│   ├── tools.py
-│   └── tools_schema.py
+│   ├── tools.py            # Tool implementations & dispatcher with output truncation guards
+│   └── tools_schema.py     # 12 OpenAI-compatible JSON tool schemas
 ├── Utils/
 │   ├── __init__.py
-│   └── utilities.py
-├── simpleAiAss.py
-├── requirements.txt
-├── .env.example
-├── .gitignore
+│   └── utilities.py        # Token estimation, provider detection, diagnostics, and HTTP helpers
+├── tests/
+│   ├── test_agent.py       # Integration test suite covering 11 critical scenarios
+│   └── test_context_management.py # Regression test suite covering 12 token-budget scenarios
+├── simpleAiAss.py          # Core orchestrator and interactive CLI
+├── requirements.txt        # Python package dependencies
+├── .env.example            # Environment template for Groq and Ollama
+├── .gitignore              # Protects secrets, virtualenvs, and databases
 └── README.md
 ```
 
 ## Prerequisites
 
-Before running the project, install:
-
-- Python 3.10 or a compatible version
-- [Ollama](https://ollama.com/download)
-- A WeatherAPI key from [WeatherAPI.com](https://www.weatherapi.com/) for weather features
+- **Python 3.10+** installed on macOS, Linux, or Windows
+- A free **Groq Cloud API Key** from [Groq Console](https://console.groq.com/keys)
+- *(Optional for weather)*: A free API key from [WeatherAPI.com](https://www.weatherapi.com/)
+- *(Optional for web search)*: A free API key from [Tavily.com](https://tavily.com/)
+- *(Optional for offline local mode)*: [Ollama](https://ollama.com/download)
 
 ## Setup Instructions
 
 ### 1. Clone the repository
 
 ```bash
-git clone YOUR_GITHUB_REPOSITORY_URL
-cd YOUR_REPOSITORY_FOLDER
+git clone https://github.com/chavanparth01/local-ai-assistant.git
+cd local-ai-assistant
 ```
 
-Replace the placeholders with your actual GitHub repository URL and repository folder name.
-
-### 2. Download the model
-
-Download Qwen3 4B using Ollama:
-
-```bash
-ollama pull qwen3:4b
-```
-
-Make sure Ollama is running before starting the assistant.
-
-### 3. Create a virtual environment
+### 2. Create and activate a virtual environment
 
 On macOS or Linux:
-
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 4. Install dependencies
+On Windows:
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
 
-Install the required Python packages:
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 5. Configure environment variables
+### 4. Configure environment variables
 
-Create a `.env` file in the project root. Use `.env.example` as a reference.
+Copy `.env.example` to `.env`:
 
-Example configuration:
+```bash
+cp .env.example .env
+```
 
+Edit `.env` to configure your credentials:
+
+#### Recommended: Groq Cloud Configuration
+```env
+BASE_URL=https://api.groq.com/openai/v1
+API_KEY=gsk_your_groq_api_key_here
+MODEL=openai/gpt-oss-120b
+CONTEXT_BUDGET_CHARS=32000
+
+WEATHER_API_KEY=your_weatherapi_key
+TAVILY_API_KEY=your_tavily_api_key
+DEBUG=false
+```
+
+#### Optional: Local Ollama Configuration
+To run completely offline with local Ollama, update `.env`:
 ```env
 BASE_URL=http://localhost:11434/v1
 API_KEY=ollama
 MODEL=qwen3:4b
-WEATHER_API_KEY=your_weatherapi_key
-TAVILY_API_KEY=your_tavily_api_key
+CONTEXT_BUDGET_CHARS=16000
 ```
 
-Replace `your_weatherapi_key` and `your_tavily_api_key` with your actual API keys.
+> **Security Note:** Never commit your `.env` file to Git. Your `.gitignore` is pre-configured to keep API keys and SQLite database files (`assistant.db`) private.
 
-Keep your actual `.env` file private. Never commit API keys or other secrets to GitHub.
+## Running the Assistant
 
-### 6. Run the assistant
-
-Activate your virtual environment if it is not already active, ensure Ollama is running, and execute:
+Activate your virtual environment and run:
 
 ```bash
 python simpleAiAss.py
 ```
 
-You can now interact with the assistant through the terminal.
+### CLI Options:
+1. **Start a new conversation**: Prompts for a session title and initializes a fresh chat.
+2. **Continue a previous conversation**: Displays saved sessions from SQLite and lets you resume any conversation with its full context.
 
-## How It Works
+## Running the Automated Test Suite
 
-1. The user enters a prompt.
-2. The LLM processes the request and decides whether it can answer directly or needs a tool.
-3. If a tool is needed, the application executes the corresponding Python function.
-4. The tool result is added to the conversation history.
-5. The LLM uses the result to generate a response.
-6. For requests requiring online information, the assistant can use its web search functionality, if configured.
+The project includes an automated test suite verifying tool calling, error recovery, context budgeting, and sandbox guards:
 
-## Configuration and Security
+```bash
+python -m unittest tests/test_agent.py
+```
 
-- Keep secrets in `.env`.
-- Commit `.env.example` with placeholder values only.
-- Make sure `.env`, `.venv/`, `__pycache__/`, and log files are excluded through `.gitignore`.
-- Never publish API keys or other credentials.
+All mock tests run locally without consuming API credits. If a real `gsk_...` key is present in `.env`, a live connectivity check will also execute automatically.
 
-## Future Improvements
+## Security & Privacy Considerations
 
-- Add more tools and integrations.
-- Improve response speed and error handling.
-- Add a graphical user interface.
-- Expand support for different models and APIs.
+- **Data Transmitted to Groq Cloud**: Only the prompts, conversation history (within the context budget), and tool output strings required for reasoning are transmitted via HTTPS to Groq's API.
+- **Local Isolation**: The SQLite database (`assistant.db`), private `.env` keys, and local files outside approved directories are **never** automatically sent to the cloud.
+- **Filesystem Permissions**: The assistant runs in a restricted sandbox (`session_approved_dirs`). Attempting to read or write files outside the workspace prompts the user for interactive `(y/n)` approval.
+- **Terminal Execution**: Shell commands requested via `execute_command` **always** require explicit user approval before execution and have an automatic 15-second timeout.
+
+## Troubleshooting
+
+| Error | Cause | Resolution |
+|---|---|---|
+| `Authentication Error (401)` | Missing or invalid Groq API key | Check that `API_KEY` in `.env` starts with `gsk_` and has no extra spaces. |
+| `Rate Limit Error (429)` | Exceeded free-tier TPM/RPM on Groq | The client will automatically retry after backoff. Alternatively, wait a moment or switch to local Ollama. |
+| `Connection Error` | No internet connection or endpoint down | Verify your internet connection or check [status.groq.com](https://status.groq.com). If using Ollama, ensure `ollama serve` is running. |
+| `Access denied by user` | File/command was rejected in sandbox | Answer `y` at the prompt if you trust the directory or command, or guide the agent in natural language. |
