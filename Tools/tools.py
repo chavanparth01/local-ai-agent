@@ -1,15 +1,25 @@
+# *standarad imports : 
 from datetime import datetime
-from dotenv import load_dotenv
-import requests
 import os
-from Utils.utilities import log, get_api_json
+import pathlib
 import json
+import subprocess
+
+# *Third party imports : 
+from dotenv import load_dotenv
+
+# *module imports : 
+from Storage.storage import (
+    save_user_fact,
+    update_user_fact_db,
+    delete_user_fact_db,
+)
+from Utils.utilities import log, get_api_json
 
 # *Global Variables
 user_city = ""
 
 load_dotenv()
-
 
 # !Tool1 -> Current Time Tool
 def getCurrentTime() : 
@@ -19,8 +29,10 @@ def getCurrentTime() :
 def get_weather(city):
 
     # ?Get current weather data using this free weather API 
-    base_url = "http://api.weatherapi.com/v1/current.json"
+    base_url = "https://api.weatherapi.com/v1/current.json"
     api_key = os.getenv("WEATHER_API_KEY")
+    if not api_key:
+        raise ValueError("WEATHER_API_KEY is not configured in the environment.")
 
     params = {
         "key" : api_key,
@@ -43,13 +55,17 @@ def get_weather(city):
 
 # !Tool3 -> Get the user's city
 def get_user_city() : 
+    global user_city
     if user_city == "":
-        user_city = input("Enter your city: ")
+        user_city = input("Enter your city: ").strip()
 
     return user_city
 
 # !Tool4 -> For the weather forecast
 def get_forecast(city, days, start_day=0):
+    days = int(days)
+    start_day = int(start_day)
+
     # Validate the forecast range
     if days < 1 or start_day < 0 or start_day + days > 14:
         raise ValueError(
@@ -59,6 +75,8 @@ def get_forecast(city, days, start_day=0):
 
     base_url = "https://api.weatherapi.com/v1/forecast.json"
     api_key = os.getenv("WEATHER_API_KEY")
+    if not api_key:
+        raise ValueError("WEATHER_API_KEY is not configured in the environment.")
 
     params = {
         "key": api_key,
@@ -90,6 +108,8 @@ def get_forecast(city, days, start_day=0):
 def web_search(query):
     base_url = "https://api.tavily.com/search"
     api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        raise ValueError("TAVILY_API_KEY is not configured in the environment.")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -106,33 +126,129 @@ def web_search(query):
 
     results = []
 
-    for item in data["results"]:
+    for item in data.get("results", []):
         results.append({
-            "title": item["title"],
-            "content" : item["content"][:500],
-            "url" : item["url"],
-            "score" : item["score"],
+            "title": item.get("title", ""),
+            "content" : (item.get("content") or "")[:500],
+            "url" : item.get("url", ""),
+            "score" : item.get("score", 0),
         })
 
 
     return results
 
+
+# !Tool6 -> Save User Facts for Long Term Memory
+def save_user_facts_to_db(fact):
+    try:
+        save_user_fact(fact)
+        return f"Successfully saved fact to memory: {fact}"
+
+    except Exception as e:
+        return f"Failed to save fact: {str(e)}"
+
+# !Tool7 -> Delete User Fact
+def delete_user_fact(fact_id):
+    try:
+        delete_user_fact_db(int(fact_id))
+        return f"Successfully deleted fact ID: {fact_id}"
+    except Exception as e:
+        return f"Failed to delete fact: {str(e)}"
+
+# !Tool8 -> Update User Fact
+def update_user_fact(fact_id, new_fact):
+    try:
+        update_user_fact_db(int(fact_id), new_fact)
+        return f"Successfully updated fact ID {fact_id} to: {new_fact}"
+    except Exception as e:
+        return f"Failed to update fact: {str(e)}"
+
+
+# !Tool9 -> Read Local File
+def read_file(file_path):
+    try:
+        path = pathlib.Path(os.path.expanduser(file_path)).resolve()
+        if not path.is_file():
+            return f"Error: File not found at '{file_path}'."
+        content = path.read_text(encoding="utf-8", errors="replace")
+        return content[:10000]
+    except Exception as e:
+        return f"Failed to read file: {str(e)}"
+
+# !Tool10 -> Write Local File
+def write_file(file_path, content):
+    try:
+        path = pathlib.Path(os.path.expanduser(file_path)).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return f"Successfully wrote to '{file_path}'."
+    except Exception as e:
+        return f"Failed to write file: {str(e)}"
+
+# !Tool11 -> List Local Directory
+def list_directory(directory_path):
+    try:
+        path = pathlib.Path(os.path.expanduser(directory_path)).resolve()
+        if not path.is_dir():
+            return f"Error: Directory not found at '{directory_path}'."
+        entries = []
+        for item in sorted(path.iterdir()):
+            item_type = "DIR" if item.is_dir() else "FILE"
+            entries.append(f"[{item_type}] {item.name}")
+        return entries
+    except Exception as e:
+        return f"Failed to list directory: {str(e)}"
+
+
+# !Tool12 -> Execute Terminal Command,
+def execute_command(command):
+    """Executes a shell command and returns the standard output and error."""
+    try:
+        # timeout=15 ensures the agent can't freeze your system with infinite loops
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        
+        output = result.stdout.strip()
+        error = result.stderr.strip()
+        
+        if result.returncode == 0:
+            return output if output else "Command executed successfully with no output."
+        else:
+            return f"Command failed with error code {result.returncode}:\n{error}"
+            
+    except subprocess.TimeoutExpired:
+        return "Error: Command timed out after 15 seconds."
+    except Exception as e:
+        return f"Failed to execute command: {str(e)}"
+
+
 # !Function to run tools
 def run_tool(tool_call):
-    func_name = tool_call.function.name
-    func_arguments = tool_call.function.arguments
-
-    actual_func = function_map[func_name]
-    args = json.loads(func_arguments)
-
     try:
+        func_name = getattr(getattr(tool_call, "function", None), "name", "")
+        func_arguments = getattr(getattr(tool_call, "function", None), "arguments", "{}")
+
+        if func_name not in function_map:
+            return f"error: Tool '{func_name}' is not recognized."
+
+        actual_func = function_map[func_name]
+        args = json.loads(func_arguments) if func_arguments else {}
+
+        if not isinstance(args, dict):
+            return f"error: Arguments for tool '{func_name}' must be a dictionary/object."
+
         func_response = actual_func(**args)
         log(f"Tool {func_name} called successfully with arguments : {args} and response : {func_response}")
 
     except Exception as e:
+        func_name = getattr(getattr(tool_call, "function", None), "name", "unknown")
         func_response = f"error while running function {func_name} : {str(e)}"
 
-    
     return func_response
 
 
@@ -143,4 +259,12 @@ function_map = {
     "get_user_city" : get_user_city,
     "get_forecast" : get_forecast,
     "web_search" : web_search,
+    "save_user_facts_to_db" : save_user_facts_to_db,
+    "save_user_fact" : save_user_facts_to_db,
+    "delete_user_fact": delete_user_fact,
+    "update_user_fact": update_user_fact,
+    "read_file": read_file,
+    "write_file": write_file,
+    "list_directory": list_directory,
+    "execute_command": execute_command,
 }

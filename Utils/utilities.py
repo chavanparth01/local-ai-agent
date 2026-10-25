@@ -1,15 +1,15 @@
+# *standarad imports : 
 import os
+
+# *Third party imports : 
 import requests
 
 start_code = "\033[91m"
 end_code = "\033[0m"
 
 def log(message):
-    if os.getenv("DEBUG").lower() == "true":
-        print(f"    {start_code}{message}{end_code}")  
-
-
-import requests
+    if (os.getenv("DEBUG") or "").lower() == "true":
+        print(f"    {start_code}{message}{end_code}")
 
 def get_api_json(url, headers, payload, timeout):
     try:
@@ -76,4 +76,6 @@ def get_api_key(API):
 
     if not key:
         raise Exception(f"The api key {API} is not configured in the env file")
+
+    return key
 

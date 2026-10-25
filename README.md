@@ -21,18 +21,23 @@ The diagram below illustrates the project's architecture and how its components 
 
 ## Features
 
-- Runs a local LLM using Ollama.
-- Uses function/tool calling to decide when a Python function should execute.
-- Retrieves current weather information.
-- Retrieves weather forecasts for upcoming days.
-- Provides the current date and time.
-- Supports web search for queries requiring online information.
-- Keeps API keys and configuration in environment variables.
+- **Local LLM Execution** — Runs local LLMs via Ollama (or any OpenAI-compatible API).
+- **Autonomous Tool Calling** — Agent evaluates queries and dynamically executes Python tools.
+- **Persistent Memory & Storage** — SQLite-backed conversation history and long-term user facts memory.
+- **Weather & Forecasts** — Retrieves current weather and multi-day forecasts via WeatherAPI.
+- **Live Web Search** — Queries real-time web results using Tavily Search API.
+- **File System Operations** — Read files, write files, and explore directories on the host machine.
+- **Terminal Execution** — Execute shell commands with safety timeouts.
+- **Interactive Security Sandbox** — Confirms user consent before accessing paths outside approved directories or executing shell commands.
+- **Conversation Session Management** — Pick up previous chat threads or start fresh conversations with context budget limits.
 
 ## Project Structure
 
 ```text
 PY/
+├── Storage/
+│   ├── __init__.py
+│   └── storage.py
 ├── Tools/
 │   ├── __init__.py
 │   ├── tools.py
@@ -104,9 +109,10 @@ BASE_URL=http://localhost:11434/v1
 API_KEY=ollama
 MODEL=qwen3:4b
 WEATHER_API_KEY=your_weatherapi_key
+TAVILY_API_KEY=your_tavily_api_key
 ```
 
-Replace `your_weatherapi_key` with your actual API key from WeatherAPI.com.
+Replace `your_weatherapi_key` and `your_tavily_api_key` with your actual API keys.
 
 Keep your actual `.env` file private. Never commit API keys or other secrets to GitHub.
 
