@@ -34,7 +34,10 @@ def get_provider_info(base_url=None, model=None):
     base_url = (base_url or os.getenv("BASE_URL") or "").strip().lower()
     model = (model or os.getenv("MODEL") or "").strip()
 
-    if "groq.com" in base_url or "openai/gpt-oss-120b" in model:
+    if "googleapis.com" in base_url or "gemini" in model.lower():
+        provider = "Google Gemini"
+        is_cloud = True
+    elif "groq.com" in base_url or "openai/gpt-oss-120b" in model:
         provider = "Groq Cloud"
         is_cloud = True
     elif "localhost" in base_url or "127.0.0.1" in base_url or "11434" in base_url:
@@ -242,32 +245,56 @@ def estimate_request_tokens(messages: list, tools: list = None, completion_reser
 
 def get_provider_budgets(provider_info: dict, max_request_tokens_env=None, max_completion_tokens_env=None):
     """
-    Determines conservative token budget limits based on the active provider.
-    Groq Free Tier has a strict 8,000 TPM limit for openai/gpt-oss-120b.
-    We target 6,000 total request tokens (a 25% safety margin below 8,000),
-    reserving 1,500 tokens for completion.
+    Determines token budget limits based on the active provider and model.
+    - Google Gemini (gemini-3.5-flash-lite):
+      Dashboard quotas: 15 RPM, 250,000 TPM, 500 RPD.
+      Allocates 64,000 request tokens with 4,096 completion tokens.
+    - Groq Cloud:
+      30,000 TPM limit on 8B models (12,000 request tokens).
+      8,000 TPM limit on 120B models (6,000 request tokens).
+    - Local / Ollama:
+      16,000 request tokens.
     """
-    is_groq = provider_info.get("provider") == "Groq Cloud" or "groq" in provider_info.get("base_url", "").lower()
+    base_url = str(provider_info.get("base_url", "")).lower()
+    model = str(provider_info.get("model", "")).lower()
+    provider = str(provider_info.get("provider", "")).lower()
+
+    is_gemini = "gemini" in model or "googleapis.com" in base_url or "gemini" in provider
+    is_groq = "groq" in provider or "groq" in base_url
 
     # Allow environment overrides if specified
     env_req = max_request_tokens_env or os.getenv("MAX_REQUEST_TOKENS")
     env_comp = max_completion_tokens_env or os.getenv("MAX_COMPLETION_TOKENS")
 
+    if is_gemini:
+        default_req = 64000
+        default_comp = 4096
+    elif is_groq:
+        if "llama-3.1-8b" in model or "llama3-8b" in model or "8b" in model:
+            default_req = 12000
+            default_comp = 2048
+        else:
+            default_req = 6000
+            default_comp = 1500
+    else:
+        default_req = 16000
+        default_comp = 2048
+
     if env_req:
         try:
             max_request = int(env_req)
         except ValueError:
-            max_request = 6000 if is_groq else 16000
+            max_request = default_req
     else:
-        max_request = 6000 if is_groq else 16000
+        max_request = default_req
 
     if env_comp:
         try:
             max_comp = int(env_comp)
         except ValueError:
-            max_comp = 1500 if is_groq else 2048
+            max_comp = default_comp
     else:
-        max_comp = 1500 if is_groq else 2048
+        max_comp = default_comp
 
     return max_request, max_comp
 

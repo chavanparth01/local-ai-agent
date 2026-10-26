@@ -120,6 +120,38 @@ def get_conversations():
     conn.close()
     return rows
 
+
+def delete_conversation(conversation_id):
+    """Delete a conversation and all its associated messages."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+    conn.close()
+
+
+def delete_all_conversations():
+    """Delete all conversations and their messages from the database."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM conversations")
+    conn.close()
+
+
+def update_conversation_title(conversation_id, new_title):
+    """Update the title of an existing conversation."""
+    cleaned = (new_title or "").strip()
+    if not cleaned:
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "UPDATE conversations SET title = ? WHERE id = ?",
+            (cleaned, conversation_id)
+        )
+    conn.close()
+
 def save_user_fact(fact):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(

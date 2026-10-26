@@ -1,6 +1,7 @@
 # *standarad imports : 
 from datetime import datetime
 import os
+import sys
 import pathlib
 import json
 import subprocess
@@ -14,11 +15,48 @@ from Storage.storage import (
     save_user_fact,
     update_user_fact_db,
     delete_user_fact_db,
+    get_user_facts,
 )
 from Utils.utilities import log, get_api_json, log_tool_execution
 
-# *Global Variables
-user_city = ""
+# User City Helpers
+def get_saved_user_city():
+    """Retrieve the saved city from the SQLite user_facts table if it exists."""
+    try:
+        facts = get_user_facts()
+        for _, fact in facts:
+            lower = fact.lower()
+            if "user city:" in lower or "city:" in lower:
+                return fact.split(":", 1)[1].strip()
+            if "city is:" in lower or "city is" in lower:
+                return fact.split("is", 1)[1].replace(":", "").strip()
+            if "departure city is:" in lower:
+                return fact.split("is", 1)[1].replace(":", "").strip()
+            if "lives in" in lower:
+                return fact.split("lives in", 1)[1].replace(":", "").strip()
+    except Exception:
+        pass
+    return None
+
+
+def save_user_city(city: str):
+    """Save or update the user city in the SQLite user_facts table."""
+    cleaned = (city or "").strip()
+    if not cleaned:
+        return
+    try:
+        facts = get_user_facts()
+        for fid, ftext in facts:
+            lower = ftext.lower()
+            if any(k in lower for k in ["user city:", "city:", "city is", "departure city is"]):
+                update_user_fact_db(fid, f"User city: {cleaned}")
+                return
+        save_user_fact(f"User city: {cleaned}")
+    except Exception:
+        pass
+
+# Backward compatibility alias
+set_user_city = save_user_city
 
 load_dotenv()
 
@@ -55,12 +93,29 @@ def get_weather(city):
     }
 
 # !Tool3 -> Get the user's city
-def get_user_city() : 
-    global user_city
-    if user_city == "":
-        user_city = input("Enter your city: ").strip()
+def get_user_city(): 
+    """
+    Returns the user's city.
+    1. First checks the SQLite user_facts table. If already saved, reuses it.
+    2. Otherwise, asks the user through the interface, saves it to user_facts, and reuses it.
+    """
+    saved_city = get_saved_user_city()
+    if saved_city:
+        return saved_city
 
-    return user_city
+    # Web mode (Streamlit)
+    if os.getenv("ASSISTANT_MODE") == "web":
+        return "City is not configured yet. Please enter your city in the sidebar."
+
+    # CLI mode
+    try:
+        entered = input("Please enter your city: ").strip()
+        if entered:
+            save_user_city(entered)
+            return entered
+        return "Unknown city"
+    except (EOFError, KeyboardInterrupt):
+        return "Unknown city"
 
 # !Tool4 -> For the weather forecast
 def get_forecast(city, days, start_day=0):
@@ -259,9 +314,14 @@ def execute_command(command):
 # !Function to run tools
 def run_tool(tool_call):
     start_time = time.time()
-    func_name = getattr(getattr(tool_call, "function", None), "name", "unknown")
-    try:
+    if isinstance(tool_call, dict):
+        func_obj = tool_call.get("function") or {}
+        func_name = func_obj.get("name", "unknown")
+        func_arguments = func_obj.get("arguments", "{}")
+    else:
+        func_name = getattr(getattr(tool_call, "function", None), "name", "unknown")
         func_arguments = getattr(getattr(tool_call, "function", None), "arguments", "{}")
+    try:
 
         if func_name not in function_map:
             err = f"error: Tool '{func_name}' is not recognized."

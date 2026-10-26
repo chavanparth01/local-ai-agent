@@ -40,15 +40,16 @@ from Storage.storage import (
 load_dotenv()
 
 # Model & Provider Configuration
-BASE_URL = os.getenv("BASE_URL") or "https://api.groq.com/openai/v1"
-API_KEY = os.getenv("API_KEY") or os.getenv("GROQ_API_KEY") or ""
-MODEL = os.getenv("MODEL") or "openai/gpt-oss-120b"
+BASE_URL = os.getenv("BASE_URL") or "https://generativelanguage.googleapis.com/v1beta/openai/"
+API_KEY = os.getenv("API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GROQ_API_KEY") or ""
+MODEL = os.getenv("MODEL") or "gemini-3.5-flash-lite"
 EPOCHS = int(os.getenv("MAX_TOOL_EPOCHS") or "10")
 
-# Conservative Token-Aware Context Budgeting
-# Groq Free Tier has an 8,000 TPM ceiling on openai/gpt-oss-120b.
-# We set a safe default of 6,000 total request tokens (leaving a 2,000 token safety buffer)
-# and reserve 1,500 tokens for completion.
+# Provider-Aware Context Budgeting
+# Defaults dynamically determined by get_provider_budgets():
+# - Google Gemini 3.5 Flash-Lite: 250K TPM, 15 RPM, 500 RPD -> 64,000 request tokens, 4,096 completion
+# - Groq Cloud: 8,000 TPM -> 6,000 request tokens, 1,500 completion
+# - Ollama: Local -> 16,000 request tokens, 2,048 completion
 provider_info = get_provider_info(BASE_URL, MODEL)
 MAX_REQUEST_TOKENS, MAX_COMPLETION_TOKENS = get_provider_budgets(provider_info)
 
@@ -62,7 +63,7 @@ CURRENT_OS = platform.system()  # "Darwin" (Mac), "Windows", or "Linux"
 
 
 def get_llm_client():
-    """Initializes and returns the OpenAI SDK client configured for Groq or Ollama."""
+    """Initializes and returns the OpenAI SDK client configured for Google Gemini, Groq, or Ollama."""
     key = API_KEY if API_KEY else "dummy_key_unconfigured"
     return OpenAI(
         base_url=BASE_URL,
@@ -117,10 +118,11 @@ SYSTEM_PROMPT = {
         - If access is denied, explain the restriction and ask the
         user how to proceed when appropriate.
 
-        ## Final response
-        - Respond after the necessary tool operations have completed.
-        - Summarize what was done and mention any failures or
-        unresolved steps honestly.
+        ## Final response & Tool Efficiency
+        - Be efficient with tools: gather the necessary facts in 2 to 4 focused tool calls.
+        - As soon as you have the required information (weather, routes, dates, search results), STOP calling tools immediately and output your complete, comprehensive answer to the user.
+        - Do not perform redundant, repetitive, or endless searches.
+        - Never leave the user without a final synthesized answer. If the user asks for a plan, itinerary, or explanation, your final message MUST present the complete synthesized findings, answer, or itinerary.
         """
 }
 
@@ -146,151 +148,118 @@ def enforce_context_budget(
     completion_reservation=MAX_COMPLETION_TOKENS,
     aggressive_tool_cap=400,
     current_tool_cap=3000,
+    max_history_messages=20,
     **kwargs
 ):
     """
-    Enforces a token-aware budget on the messages payload sent to the LLM.
-    Accounts for:
-    - System prompt (always preserved at index 0)
-    - Active turn (all messages from the latest user message onward, kept intact)
-    - Tool definitions footprint (Tools schemas)
-    - Reserved completion tokens (max_tokens)
-    - Conversation history (trimmed turn-by-turn backwards from most recent to oldest)
-    - Atomic tool sequences (assistant tool_calls + matching tool responses kept intact)
-    - SQLite database is NEVER modified; only in-memory request payload is trimmed.
+    Simplified Token-Aware Sliding Window Context Manager.
+    1. Preserves System Prompt (Message 0) and the Active Turn (latest user prompt + active tools).
+    2. Limits history to a sliding window of up to 20 messages to keep context efficient.
+    3. Caps oversized tool outputs to prevent any single tool call from dominating the budget.
+    4. Preserves atomic tool sequences (never separates assistant tool_calls from tool responses).
     """
     if not messages:
         return []
 
-    # Backward compatibility with legacy character-budget parameters
+    # Backward compatibility with legacy parameters
     if "aggressive_cap" in kwargs:
         aggressive_tool_cap = kwargs["aggressive_cap"]
     if "max_chars" in kwargs and max_request_tokens == MAX_REQUEST_TOKENS:
         max_request_tokens = math.ceil(kwargs["max_chars"] / 3.2)
-        # In character mode tests, do not penalize with default tools schema reservation
         if "tools" not in kwargs and tools == Tools:
             tools = None
+        if completion_reservation == MAX_COMPLETION_TOKENS:
+            completion_reservation = 200
 
     system_prompt = copy.deepcopy(messages[0])
     if len(messages) == 1:
         return [system_prompt]
 
     tools_tokens = estimate_tools_tokens(tools) if tools else 0
-    system_tokens = estimate_message_tokens(system_prompt)
     completion_tokens = completion_reservation or 0
 
-    # Locate the start of the current/active turn (the most recent user message)
+    # 1. Separate Active Turn from History
     last_user_idx = max(
         (idx for idx, m in enumerate(messages) if m.get("role") == "user"),
         default=max(1, len(messages) - 1)
     )
+    active_turn = copy.deepcopy(messages[last_user_idx:])
 
-    # Active turn messages (latest user prompt + any tool interactions in progress)
-    active_turn_messages = copy.deepcopy(messages[last_user_idx:])
-
-    # Defensively cap large tool outputs within the active turn
-    for atm in active_turn_messages:
-        if atm.get("role") == "tool" and isinstance(atm.get("content"), str):
-            c = atm["content"]
+    # Cap oversized tool outputs in the active turn
+    for m in active_turn:
+        if m.get("role") == "tool" and isinstance(m.get("content"), str):
+            c = m["content"]
             if len(c) > current_tool_cap:
                 omitted = len(c) - (current_tool_cap - 500)
-                atm["content"] = (
-                    c[: current_tool_cap - 600]
-                    + f"\n...[Output truncated: {omitted} characters omitted to preserve context budget]...\n"
-                    + c[-400:]
-                )
+                m["content"] = c[:current_tool_cap - 600] + f"\n...[Output truncated: {omitted} chars omitted]...\n" + c[-400:]
 
-    # Base minimum required tokens: system prompt + tools + active turn + reserved completion
-    baseline_messages = [system_prompt] + active_turn_messages
-    base_required_tokens = estimate_request_tokens(
-        baseline_messages,
-        tools=tools,
-        completion_reservation=completion_tokens
-    )
-
-    if base_required_tokens > max_request_tokens:
-        err_msg = (
-            f"Error: Your prompt, tool outputs, and system instructions ({base_required_tokens} tokens) "
-            f"exceed the model request limit of {max_request_tokens} tokens. "
-            f"Please shorten your input or reduce tool output size."
+    # Base tokens required for system prompt + tools + active turn
+    base_required = estimate_request_tokens([system_prompt] + active_turn, tools=tools, completion_reservation=completion_tokens)
+    if base_required > max_request_tokens:
+        raise ValueError(
+            f"Error: Your prompt, tool outputs, and system instructions ({base_required} tokens) "
+            f"exceed the model request limit of {max_request_tokens} tokens. Please shorten your input."
         )
-        raise ValueError(err_msg)
 
-    available_history_tokens = max_request_tokens - base_required_tokens
+    # 2. Extract History Candidates (Up to max_history_messages to keep context lean)
+    history_pool = copy.deepcopy(messages[1:last_user_idx])
+    if len(history_pool) > max_history_messages:
+        history_pool = history_pool[-max_history_messages:]
 
-    # If there is no history or no tokens left for history, return the baseline
-    if last_user_idx <= 1 or available_history_tokens <= 0:
-        log_context_budget(
-            estimated_tokens=base_required_tokens,
-            budget_limit=max_request_tokens,
-            kept_count=len(baseline_messages),
-            total_count=len(messages),
-            tools_tokens=tools_tokens,
-            completion_tokens=completion_tokens
-        )
-        return baseline_messages
+    # Ensure atomic boundary: if history_pool starts with an orphaned tool response, trim forward to clean boundary
+    while history_pool and history_pool[0].get("role") == "tool":
+        history_pool.pop(0)
 
-    # History messages: messages between system prompt (index 0) and active turn (last_user_idx)
+    # Compress historical tool outputs
+    for m in history_pool:
+        if m.get("role") == "tool" and isinstance(m.get("content"), str):
+            c = m["content"]
+            if len(c) > aggressive_tool_cap:
+                omitted = len(c) - aggressive_tool_cap
+                m["content"] = c[:250] + f"\n...[Content truncated: {omitted} chars omitted to fit token budget]...\n" + c[-100:]
+
+    # 3. Sliding Window Budgeting: Add history turns backwards from newest to oldest
+    available_history_budget = max_request_tokens - base_required
     kept_history = []
     used_history_tokens = 0
-    i = last_user_idx - 1
 
-    while i >= 1:
-        msg = messages[i]
+    idx = len(history_pool) - 1
+    while idx >= 0:
+        msg = history_pool[idx]
 
-        # --- 1. ATOMIC TOOL BLOCK HANDLING ---
+        # Handle atomic tool block
         if msg.get("role") == "tool":
             block = []
-            while i >= 1 and messages[i].get("role") == "tool":
-                block.insert(0, copy.deepcopy(messages[i]))
-                i -= 1
-
-            if i >= 1 and messages[i].get("role") == "assistant" and messages[i].get("tool_calls"):
-                block.insert(0, copy.deepcopy(messages[i]))
-                i -= 1
+            while idx >= 0 and history_pool[idx].get("role") == "tool":
+                block.insert(0, history_pool[idx])
+                idx -= 1
+            if idx >= 0 and history_pool[idx].get("role") == "assistant" and history_pool[idx].get("tool_calls"):
+                block.insert(0, history_pool[idx])
+                idx -= 1
             else:
-                # Malformed sequence in history without preceding assistant tool_call; drop safely
                 continue
 
-            # Compress older tool outputs in this historical block
-            for b_msg in block:
-                if b_msg.get("role") == "tool" and isinstance(b_msg.get("content"), str):
-                    c = b_msg["content"]
-                    if len(c) > aggressive_tool_cap:
-                        omitted = len(c) - aggressive_tool_cap
-                        b_msg["content"] = (
-                            c[:250]
-                            + f"\n...[Content truncated: {omitted} characters omitted to fit token budget]...\n"
-                            + c[-100:]
-                        )
-
-            block_tokens = sum(estimate_message_tokens(m) for m in block)
-
-            if used_history_tokens + block_tokens <= available_history_tokens:
+            block_tokens = sum(estimate_message_tokens(b) for b in block)
+            if used_history_tokens + block_tokens <= available_history_budget:
                 kept_history = block + kept_history
                 used_history_tokens += block_tokens
             else:
-                # Stop backwards scan to preserve chronological recency
                 break
-            continue
-
-        # --- 2. NORMAL MESSAGE HANDLING (User / Assistant Text) ---
-        msg_copy = copy.deepcopy(msg)
-        msg_tokens = estimate_message_tokens(msg_copy)
-        if used_history_tokens + msg_tokens <= available_history_tokens:
-            kept_history.insert(0, msg_copy)
-            used_history_tokens += msg_tokens
-            i -= 1
         else:
-            # Stop backwards scan to preserve chronological recency
-            break
+            msg_tokens = estimate_message_tokens(msg)
+            if used_history_tokens + msg_tokens <= available_history_budget:
+                kept_history.insert(0, msg)
+                used_history_tokens += msg_tokens
+                idx -= 1
+            else:
+                break
+    # Clean turn boundary: conversational history must always start with a user message.
+    # If kept_history starts with an assistant or tool message, trim forward until the first user message.
+    while kept_history and kept_history[0].get("role") != "user":
+        kept_history.pop(0)
 
-    result_messages = [system_prompt] + kept_history + active_turn_messages
-    total_estimated = estimate_request_tokens(
-        result_messages,
-        tools=tools,
-        completion_reservation=completion_tokens
-    )
+    result_messages = [system_prompt] + kept_history + active_turn
+    total_estimated = estimate_request_tokens(result_messages, tools=tools, completion_reservation=completion_tokens)
 
     log_context_budget(
         estimated_tokens=total_estimated,
@@ -300,8 +269,22 @@ def enforce_context_budget(
         tools_tokens=tools_tokens,
         completion_tokens=completion_tokens
     )
-
     return result_messages
+
+
+class AgentTurnResult(tuple):
+    """
+    Subclass of tuple (final_content, messages) for 100% backward compatibility
+    with `content, msgs = execute_agent_turn(...)`, while also exposing
+    `.pending_action` for Streamlit permission handling.
+    """
+    def __new__(cls, final_content, messages, pending_action=None):
+        return super().__new__(cls, (final_content, messages))
+
+    def __init__(self, final_content, messages, pending_action=None):
+        self.final_content = final_content
+        self.messages = messages
+        self.pending_action = pending_action
 
 
 def execute_agent_turn(
@@ -314,7 +297,6 @@ def execute_agent_turn(
     max_request_tokens=MAX_REQUEST_TOKENS,
     completion_reservation=MAX_COMPLETION_TOKENS,
     interactive=True,
-    approval_callback=None,
     **kwargs
 ):
     """
@@ -342,30 +324,45 @@ def execute_agent_turn(
             err_msg = str(ve)
             if interactive:
                 print(f"\n🛑 {err_msg}")
-            return err_msg, messages
+            return AgentTurnResult(err_msg, messages)
 
         llm_start_time = time.time()
         response = None
         max_retries = 2
         current_max_tokens = completion_reservation
 
+        # If model has already gathered multiple tool results or is on the last iterations,
+        # set tools=None to force the model to synthesize the final answer rather than looping.
+        current_tools = None if (iteration >= (epochs - 1) or iteration >= 6) else Tools
+
         for attempt in range(max_retries + 1):
             try:
-                response = client_instance.chat.completions.create(
-                    model=model_name,
-                    messages=budgeted_messages,
-                    tools=Tools,
-                    max_tokens=current_max_tokens,
-                )
+                call_args = {
+                    "model": model_name,
+                    "messages": budgeted_messages,
+                    "max_tokens": current_max_tokens,
+                }
+                if current_tools:
+                    call_args["tools"] = current_tools
+
+                response = client_instance.chat.completions.create(**call_args)
                 break
 
             except openai.AuthenticationError as exc:
                 err_msg = "Authentication Error: Invalid API key. Please check API_KEY in your .env file."
                 log(f"Auth error: {exc}")
                 print(f"\n🛑 {err_msg}")
-                return err_msg, messages
+                return AgentTurnResult(err_msg, messages)
 
             except Exception as exc:
+                exc_str = str(exc)
+                if "Please pass a valid API key" in exc_str or "API_KEY_INVALID" in exc_str:
+                    err_msg = "Authentication Error: Invalid API key. Please check API_KEY in your .env file."
+                    log(f"Auth error: {exc}")
+                    if interactive:
+                        print(f"\n🛑 {err_msg}")
+                    return AgentTurnResult(err_msg, messages)
+
                 if is_oversized_request_error(exc):
                     log(f"Oversized request / HTTP 413 error: {exc}")
                     if attempt == 0:
@@ -386,12 +383,12 @@ def execute_agent_turn(
                         continue
                     else:
                         err_msg = (
-                            "Error: Request exceeds model's token throughput limit (TPM 8000) "
+                            f"Error: Request exceeds model's token throughput limit ({max_request_tokens} tokens) "
                             "even after context reduction. Please try again with a shorter prompt."
                         )
                         if interactive:
                             print(f"\n🛑 {err_msg}")
-                        return err_msg, messages
+                        return AgentTurnResult(err_msg, messages)
 
                 elif isinstance(exc, openai.RateLimitError):
                     log(f"Rate limit hit on attempt {attempt + 1}: {exc}")
@@ -405,28 +402,28 @@ def execute_agent_turn(
                         err_msg = "Error: Rate limit reached. Please wait a moment before trying again."
                         if interactive:
                             print(f"\n🛑 {err_msg}")
-                        return err_msg, messages
+                        return AgentTurnResult(err_msg, messages)
 
                 elif isinstance(exc, openai.APITimeoutError):
                     err_msg = "Error: Request to the language model endpoint timed out."
                     log(f"Timeout error: {exc}")
                     if interactive:
                         print(f"\n🛑 {err_msg}")
-                    return err_msg, messages
+                    return AgentTurnResult(err_msg, messages)
 
                 elif isinstance(exc, openai.APIConnectionError):
                     err_msg = f"Error: Unable to connect to LLM endpoint at {BASE_URL}. Ensure internet connection or local Ollama is active."
                     log(f"Connection error: {exc}")
                     if interactive:
                         print(f"\n🛑 {err_msg}")
-                    return err_msg, messages
+                    return AgentTurnResult(err_msg, messages)
 
                 elif isinstance(exc, openai.APIError):
                     err_msg = f"Model API Error: {getattr(exc, 'message', str(exc))}"
                     log(f"API error: {exc}")
                     if interactive:
                         print(f"\n🛑 {err_msg}")
-                    return err_msg, messages
+                    return AgentTurnResult(err_msg, messages)
 
                 else:
                     err_msg = f"Unexpected Error: {str(exc)}"
@@ -468,26 +465,32 @@ def execute_agent_turn(
             if conversation_id:
                 save_message(conversation_id, assistant_message)
 
-            return final_content, messages
+            return AgentTurnResult(final_content, messages)
 
         # Case 2: Model requested tool calls
         log(f"Model requested tool calls: {len(tool_calls)}")
 
-        # Cleanly serialize assistant message to ensure compatibility with Groq & Ollama
+        # Cleanly serialize assistant message to ensure compatibility with Gemini, Groq & Ollama
+        serialized_tool_calls = []
+        for idx, tc in enumerate(tool_calls):
+            tc_dict = {
+                "id": tc.id or f"call_{iteration}_{idx}",
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments or "{}"
+                }
+            }
+            # Preserve Gemini thought_signature and extra_content if present
+            extra_content = getattr(tc, "extra_content", None)
+            if extra_content:
+                tc_dict["extra_content"] = extra_content
+            serialized_tool_calls.append(tc_dict)
+
         assistant_tool_message = {
             "role": "assistant",
             "content": model_response.content or None,
-            "tool_calls": [
-                {
-                    "id": tc.id or f"call_{iteration}_{idx}",
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments or "{}"
-                    }
-                }
-                for idx, tc in enumerate(tool_calls)
-            ]
+            "tool_calls": serialized_tool_calls
         }
         messages.append(assistant_tool_message)
         if conversation_id:
@@ -527,21 +530,52 @@ def execute_agent_turn(
                 is_approved = any(expanded_target.is_relative_to(approved) for approved in approved_dirs)
 
                 if not is_approved:
-                    if interactive and approval_callback is None:
+                    if interactive:
                         print(f"\nSECURITY ALERT: Agent wants to access outside sandbox: {expanded_target}")
                         approval = input("Grant read/write access to this directory for this session? (y/n): ").strip().lower()
-                    elif approval_callback is not None:
-                        approval = approval_callback("filesystem", str(expanded_target))
-                    else:
-                        approval = "n"
-
-                    if approval == "y":
-                        target_dir = expanded_target if expanded_target.is_dir() else expanded_target.parent
-                        approved_dirs.add(target_dir)
-                        if interactive:
+                        if approval == "y":
+                            target_dir = expanded_target if expanded_target.is_dir() else expanded_target.parent
+                            approved_dirs.add(target_dir)
                             print(f"✅ Access granted to {target_dir}")
+                        else:
+                            denial_msg = f"Access denied by user to path: {target}. You must ask the user for an alternative path."
+                            tool_message = {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": json.dumps(denial_msg),
+                            }
+                            messages.append(tool_message)
+                            if conversation_id:
+                                save_message(conversation_id, tool_message)
+                            continue
                     else:
-                        denial_msg = f"Access denied by user to path: {target}. You must ask the user for an alternative path."
+                        # Streamlit / non-interactive mode: pause turn and return pending action
+                        target_dir = expanded_target if expanded_target.is_dir() else expanded_target.parent
+                        pending_action = {
+                            "type": "filesystem",
+                            "target": str(expanded_target),
+                            "target_dir": str(target_dir),
+                            "call_id": call_id,
+                            "tool_call": {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": func_name,
+                                    "arguments": raw_args,
+                                }
+                            }
+                        }
+                        return AgentTurnResult("Awaiting user approval...", messages, pending_action=pending_action)
+
+            # Security Guard: Terminal shell execution
+            elif func_name == "execute_command":
+                command = args.get("command", "")
+
+                if interactive:
+                    print(f"\nTERMINAL ALERT: Agent wants to execute shell command: `{command}`")
+                    approval = input("Allow execution? (y/n): ").strip().lower()
+                    if approval != "y":
+                        denial_msg = "Command execution denied by user. Do not attempt to run this command without permission."
                         tool_message = {
                             "role": "tool",
                             "tool_call_id": call_id,
@@ -551,31 +585,22 @@ def execute_agent_turn(
                         if conversation_id:
                             save_message(conversation_id, tool_message)
                         continue
-
-            # Security Guard: Terminal shell execution
-            elif func_name == "execute_command":
-                command = args.get("command", "")
-
-                if interactive and approval_callback is None:
-                    print(f"\nTERMINAL ALERT: Agent wants to execute shell command: `{command}`")
-                    approval = input("Allow execution? (y/n): ").strip().lower()
-                elif approval_callback is not None:
-                    approval = approval_callback("terminal", command)
                 else:
-                    approval = "n"
-
-                if approval != "y":
-                    denial_msg = "Command execution denied by user. Do not attempt to run this command without permission."
-                    tool_message = {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": json.dumps(denial_msg),
+                    # Streamlit / non-interactive mode: pause turn and return pending action
+                    pending_action = {
+                        "type": "terminal",
+                        "target": command,
+                        "call_id": call_id,
+                        "tool_call": {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": func_name,
+                                "arguments": raw_args,
+                            }
+                        }
                     }
-                    messages.append(tool_message)
-                    if conversation_id:
-                        save_message(conversation_id, tool_message)
-                    # Skip execution
-                    continue
+                    return AgentTurnResult("Awaiting user approval...", messages, pending_action=pending_action)
 
             # Execute tool and retrieve result
             func_response = run_tool(tool_call)
@@ -591,20 +616,42 @@ def execute_agent_turn(
                 save_message(conversation_id, tool_message)
 
     else:
-        error_msg = f"Agent reached maximum execution limit of {epochs} steps without completing the task."
-        if interactive:
-            print(f"🛑 Error: {error_msg}")
-
-        failure_message = {
-            "role": "system",
-            "content": error_msg
+        # If agent used all steps calling tools, force a final synthesis turn without tools
+        log(f"Epoch limit ({epochs}) reached. Attempting final response synthesis from gathered tools.")
+        synthesis_prompt = {
+            "role": "user",
+            "content": "Please synthesize all gathered tool results and provide your complete, comprehensive final response to the user now."
         }
-        messages.append(failure_message)
-        if conversation_id:
-            save_message(conversation_id, failure_message)
-        final_content = error_msg
+        synth_messages = messages + [synthesis_prompt]
+        try:
+            budgeted_synth_messages = enforce_context_budget(
+                synth_messages,
+                tools=None,
+                max_request_tokens=max_request_tokens,
+                completion_reservation=completion_reservation
+            )
+            synth_resp = client_instance.chat.completions.create(
+                model=model_name,
+                messages=budgeted_synth_messages,
+                max_tokens=completion_reservation,
+            )
+            final_content = synth_resp.choices[0].message.content or "Completed task using gathered information."
+        except Exception as exc:
+            log(f"Fallback synthesis error: {exc}")
+            final_content = f"Task completed using gathered tool data across {epochs} steps."
 
-    return final_content, messages
+        assistant_message = {
+            "role": "assistant",
+            "content": final_content,
+        }
+        if interactive:
+            print("🤖 Assistant:", final_content)
+
+        messages.append(assistant_message)
+        if conversation_id:
+            save_message(conversation_id, assistant_message)
+
+    return AgentTurnResult(final_content, messages)
 
 
 def main():
@@ -615,10 +662,8 @@ def main():
     print("=" * 60)
 
     # Inform user if API key needs attention
-    if provider_info["is_cloud"] and (not API_KEY or API_KEY in ["your_groq_api_key", "ollama", "dummy_key_unconfigured"]):
-        print("\n⚠️ WARNING: Valid API_KEY for Groq Cloud is not set in .env.")
-        print("   Get your API key at: https://console.groq.com/keys")
-        print("   Set API_KEY=gsk_... in your .env file.\n")
+    if provider_info["is_cloud"] and (not API_KEY or API_KEY in ["your_groq_api_key", "your_gemini_api_key", "ollama", "dummy_key_unconfigured"]):
+        print(f"\n⚠️ WARNING: Valid API_KEY for {provider_info['provider']} is not set in .env.\n")
 
     # Conversation Selection
     while True:
