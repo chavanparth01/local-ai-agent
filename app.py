@@ -15,6 +15,15 @@ from dotenv import load_dotenv
 load_dotenv()
 os.environ["ASSISTANT_MODE"] = "web"
 
+# Synchronize Streamlit Cloud secrets into os.environ if available
+try:
+    if hasattr(st, "secrets"):
+        for s_key, s_val in st.secrets.items():
+            if isinstance(s_val, (str, int, float, bool)):
+                os.environ[str(s_key)] = str(s_val)
+except Exception:
+    pass
+
 from Storage.storage import (
     initialise_db,
     add_conversation,
