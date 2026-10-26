@@ -6,7 +6,7 @@ A Python-based AI assistant powered by **Google Gemini 3.5 Flash-Lite** (with op
 
 The diagram below illustrates the project's architecture and how its components interact.
 
-**[View Project HLD on Excalidraw](https://excalidraw.com/#json=fGIPpdaFOtvitql6z395Z,xwtCvoeFQmAYCfC6RUnb3w)**
+**[View Project HLD on Excalidraw](https://excalidraw.com/#json=fXWcKovPRlTJhQGEAC8en,Vnnx848SDizYeIqt2_bxIg)**
 
 ## Tech Stack
 
